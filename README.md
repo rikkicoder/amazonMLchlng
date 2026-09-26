@@ -26,8 +26,10 @@ The challenge data is not included. The code expects it at `student_resource/dat
 
 | Version | Held-out F0.5 (training data) | Public leaderboard |
 |---|---|---|
-| v1 | 0.9796 | 0.9744 |
-| v2 | pending | pending |
+| v1 | 0.9796 (training density) | 0.9744 |
+| v2 | 0.9826 (test-like density) | **0.9793** |
+
+The held-out F0.5 is measured on slice B, folds 3–4.
 
 v2 adds:
 - training density that matches the test pool;
