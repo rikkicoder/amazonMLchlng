@@ -254,7 +254,39 @@ def rule_expected_f(s, c_miss):
     return s[keep]
 
 
+def rule_gated(s, tE, t1, t2):
+    """top1_plus, but only for S1 whose has-a-match probability _e >= tE (protects singletons)."""
+    r, p, e = s._r.values, s.p.values, s._e.values
+    return s[(e >= tE) & (((r == 0) & (p >= t1)) | ((r > 0) & (p >= t2)))]
+
+
+ENT_TOP = ["p", "cos", "gap_q", "rev_rank", "rev_margin", "name_jw", "name_tri_idfcos", "addr_tri_idfcos", "num_share",
+           "num_conflict", "core_idf_q", "addr_tsr", "s2_nclaim_pj", "s2_pmax_other_pj", "unshared_max_idf_q",
+           "addr_unshared_max_idf_q"]
+
+
+def entity_features(d, pcol="p2"):
+    """One row per S1 (index qi): stage-2 score profile of its candidates + features of its best candidate."""
+    g = d.sort_values(["qi", pcol], ascending=[True, False])
+    g = g.assign(_hi=(g[pcol] > 0.5).astype(np.float32), _mid=(g[pcol] > 0.2).astype(np.float32))
+    gb = g.groupby("qi")
+    rank = gb.cumcount().values
+    ent = pd.DataFrame({"e_pmax": gb[pcol].max(), "e_psum": gb[pcol].sum(), "e_ncand": gb.size().astype(np.float32),
+                        "e_nhi": gb._hi.sum(), "e_nmid": gb._mid.sum(),
+                        "e_p2nd": g[rank == 1].set_index("qi")[pcol], "e_cosmax": gb.cos.max()})
+    top = g[rank == 0].set_index("qi")
+    for c in ENT_TOP:
+        if c in top:
+            ent[f"e_top_{c}"] = top[c]
+    return ent.astype(np.float32)
+
+
+ENT_COLS = ["e_pmax", "e_psum", "e_ncand", "e_nhi", "e_nmid", "e_p2nd", "e_cosmax"] + [f"e_top_{c}" for c in ENT_TOP]
+
+
 RULES = {
+    "gated": (rule_gated, [(tE, t1, t2) for tE in (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+                           for t1 in (0.2, 0.3, 0.4, 0.5, 0.6) for t2 in (0.6, 0.65, 0.7, 0.75, 0.8, 0.85)]),
     "threshold": (rule_threshold, [(t,) for t in np.round(np.arange(0.3, 0.96, 0.025), 3)]),
     "top1_plus": (rule_top1_plus, [(t1, t2) for t1 in np.round(np.arange(0.1, 0.8, 0.1), 1)
                                    for t2 in np.round(np.arange(0.5, 0.96, 0.05), 2) if t2 >= t1]),

@@ -196,12 +196,18 @@ def st_train(a):
     log(f"A: {rep['A_s1']:,} S1 / {len(FA):,} pairs (pos {FA.label.mean():.2%}); B: {rep['B_s1']:,} S1 / "
         f"{len(FB):,} pairs; full matcher uses {len(cols1)} features")
 
-    log("fitting cheap re-ranker and full matcher on A")
-    cheap = fit_lgb(FA[C.CHEAP].values.astype(np.float32), FA.label.values, FA.qi.values, C.LGB_PARAMS, a.n_jobs)
-    full = fit_lgb(FA[cols1].values.astype(np.float32), FA.label.values, FA.qi.values, C.LGB_FULL, a.n_jobs)
+    cp, fp = os.path.join(mdir, "cheap.lgb"), os.path.join(mdir, "full.lgb")
+    if os.path.exists(cp) and os.path.exists(fp):          # stage-1 models are deterministic: reuse them
+        import lightgbm as lgb
+        log("reusing the trained cheap re-ranker and full matcher")
+        cheap, full = lgb.Booster(model_file=cp), lgb.Booster(model_file=fp)
+    else:
+        log("fitting cheap re-ranker and full matcher on A")
+        cheap = fit_lgb(FA[C.CHEAP].values.astype(np.float32), FA.label.values, FA.qi.values, C.LGB_PARAMS, a.n_jobs)
+        full = fit_lgb(FA[cols1].values.astype(np.float32), FA.label.values, FA.qi.values, C.LGB_FULL, a.n_jobs)
+        cheap.save_model(cp, num_iteration=cheap.best_iteration)
+        full.save_model(fp, num_iteration=full.best_iteration)
     del FA
-    cheap.save_model(os.path.join(mdir, "cheap.lgb"), num_iteration=cheap.best_iteration)
-    full.save_model(os.path.join(mdir, "full.lgb"), num_iteration=full.best_iteration)
 
     rep["blocking_B"] = blocking_stats(FB.qi.values, FB.pj.values, own, k, inB)
     log(f"B blocking (test-like density): {rep['blocking_B']}")
@@ -221,12 +227,16 @@ def st_train(a):
 
     sv["p"] = predict(full, sv[cols1].values.astype(np.float32))
 
-    def choose(d, tag):
-        """Pick the decision rule on folds 0-2, report every rule on folds 3-4."""
+    def choose(d, tag, e=None):
+        """Pick the decision rule on folds 0-2, report every rule on folds 3-4. e: has-a-match prob per qi."""
         from ber.model import prep_rules
         res = {}
         s = prep_rules(d)
-        for r in C.RULES_TRY:
+        rules = list(C.RULES_TRY)
+        if e is not None:
+            s["_e"] = e.reindex(s.qi.values).values
+            rules.append("gated")
+        for r in rules:
             params, f_tune = tune_rule(d, own, k, tune, r, prepared=s)
             kept = apply_rule(d, r, params, prepared=s)
             res[r] = {"params": list(params), "f05_tune": f_tune, **macro_f05(kept.qi.values, kept.pj.values, own, k,
@@ -248,11 +258,29 @@ def st_train(a):
         m = fit_lgb(X[~te], y[~te], q[~te], C.LGB_STAGE2, a.n_jobs)
         p2[te] = predict(m, X[te])
     d2 = d[["qi", "pj"]].assign(p=p2)
-    r2, res2 = choose(d2, "stage 2")
+    # S1-level "has at least one match" model (5-fold OOF on B) for the singleton-protecting 'gated' rule
+    from ber.model import ENT_COLS, entity_features, prep_rules
+    ent = entity_features(d.assign(p2=p2)).reindex(index=np.where(inB)[0], columns=ENT_COLS)
+    Xe, ye, qe = ent.values.astype(np.float32), (k[ent.index.values] > 0).astype(np.int8), ent.index.values
+    ENT_P = dict(C.LGB_STAGE2, min_data_in_leaf=50)
+    e = np.zeros(len(ent), np.float32)
+    for f in range(5):
+        te = fold[qe] == f
+        e[te] = predict(fit_lgb(Xe[~te], ye[~te], qe[~te], ENT_P, a.n_jobs), Xe[te])
+    from sklearn.metrics import roc_auc_score
+    rep["entity_auc_B"] = float(roc_auc_score(ye, e))
+    log(f"has-a-match model: OOF AUC {rep['entity_auc_B']:.4f}")
+    emap = pd.Series(e, index=qe)
+    r2, res2 = choose(d2, "stage 2", emap)
     rep["stage2_B"] = res2
     use_s2 = res2[r2]["f05_tune"] >= res1[r1]["f05_tune"]
     rule, dd = (r2, d2) if use_s2 else (r1, sv[["qi", "pj", "p"]])
-    params, f_all = tune_rule(dd, own, k, inB, rule)          # final parameters from all of B
+    prep = prep_rules(dd)
+    if rule == "gated":
+        prep["_e"] = emap.reindex(prep.qi.values).values
+        me = fit_lgb(Xe, ye, qe, ENT_P, a.n_jobs)
+        me.save_model(os.path.join(mdir, "entity.lgb"), num_iteration=me.best_iteration)
+    params, f_all = tune_rule(dd, own, k, inB, rule, prepared=prep)          # final parameters from all of B
     est = (res2 if use_s2 else res1)[rule]["f05"]
     rep.update(use_stage2=bool(use_s2), rule=rule, params=list(params), f05_B_all=f_all, estimated_f05=est)
     m2 = fit_lgb(X, y, q, C.LGB_STAGE2, a.n_jobs)
@@ -329,18 +357,30 @@ def st_predict(a):
             if s - cuts[-1] >= 1_500_000:
                 cuts.append(int(s))
         cuts.append(len(sv))
-        outs = []
+        outs, ents = [], []
+        gated = dec.get("rule") == "gated"
+        if gated:
+            from ber.model import ENT_COLS, entity_features
         for lo, hi in zip(cuts[:-1], cuts[1:]):
             part = stage2_frame(sv.iloc[lo:hi].copy(), pool, P["nname"], P["naddr"], emb, dec.get("use_s2x", False))
-            outs.append(part[["qi", "pj"]].assign(
-                p=m2.predict(part[dec["cols2"]].values.astype(np.float32)).astype(np.float32)))
+            part["p2"] = m2.predict(part[dec["cols2"]].values.astype(np.float32)).astype(np.float32)
+            outs.append(part[["qi", "pj", "p2"]].rename(columns={"p2": "p"}))
+            if gated:
+                ents.append(entity_features(part).reindex(columns=ENT_COLS))
             del part
             gc.collect()
             log(f"  stage 2 {hi:,}/{len(sv):,}")
         d = pd.concat(outs, ignore_index=True)
     else:
         d = sv[["qi", "pj", "p"]]
-    kept = apply_rule(d, dec.get("rule", "threshold"), dec.get("params", [dec.get("t_final", 0.5)]))
+    prep = None
+    if dec.get("rule") == "gated":
+        from ber.model import prep_rules
+        me = lgb.Booster(model_file=os.path.join(mdir, "entity.lgb"))
+        ent = pd.concat(ents)
+        prep = prep_rules(d)
+        prep["_e"] = pd.Series(me.predict(ent.values.astype(np.float32)), index=ent.index).reindex(prep.qi.values).values
+    kept = apply_rule(d, dec.get("rule", "threshold"), dec.get("params", [dec.get("t_final", 0.5)]), prepared=prep)
     kept = kept.sort_values(["qi", "p"], ascending=[True, False])
     sv = sv.sort_values(["qi", "cos"], ascending=[True, False])
     os.makedirs(a.out, exist_ok=True)
