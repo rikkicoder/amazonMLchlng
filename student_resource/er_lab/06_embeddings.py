@@ -41,8 +41,10 @@ def prefix_for(model_name):
 
 
 def encode(model, texts, prefix, batch):
-    return model.encode([prefix + t for t in texts], batch_size=batch, normalize_embeddings=True,
-                        convert_to_numpy=True, show_progress_bar=True).astype(np.float32)
+    import torch
+    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
+        return model.encode([prefix + t for t in texts], batch_size=batch, normalize_embeddings=True,
+                            convert_to_numpy=True, show_progress_bar=False).astype(np.float32)
 
 
 def evaluate_model(args, model, short, prefix, s1, pool, own, cands, views):

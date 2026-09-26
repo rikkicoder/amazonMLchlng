@@ -113,6 +113,9 @@ def main():
     sel = ((c.fwd_rank < args.infer_max_rank) | c.rev_rank.notna()).values
     qa, pb = pair_texts(s1), pair_texts(pool)
     idx = np.where(sel)[0]
+    # score in length-sorted batches: far less padding, identical scores
+    plen = np.array([len(qa[q]) + len(pb[p]) for q, p in zip(c.qi.values[idx], c.pj.values[idx])])
+    idx = idx[np.argsort(plen, kind="stable")]
     scores = np.full(len(c), np.nan, np.float32)
     model.eval()
     t0 = time.time()

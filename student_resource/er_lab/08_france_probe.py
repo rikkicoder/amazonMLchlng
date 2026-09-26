@@ -16,14 +16,62 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import multiprocessing as mp
+
 import numpy as np
 import pandas as pd
-from sklearn.feature_extraction.text import HashingVectorizer, TfidfTransformer
+from sklearn.feature_extraction.text import HashingVectorizer
+from sklearn.preprocessing import normalize as l2_normalize
 
 from lab.common import base_parser, log_result, setup, step
 from lab.data import load_cached
 from lab.knn import topk_sparse
 from lab.text import load_dict, normalize_series, numbers
+
+# The pool (up to ~4.7M records per country) is streamed through worker processes twice: pass 1 returns only
+# document frequencies, pass 2 hashes + scores each chunk against the queries inside the worker and returns only
+# its top-10. No pool matrix is ever held in the main process (holding it exhausted 32 GB RAM on India).
+HV = HashingVectorizer(analyzer="char_wb", ngram_range=(2, 4), n_features=2 ** 21, alternate_sign=False,
+                       norm=None, dtype=np.float32)
+_W = {}
+
+
+def _init(dct, lvl, idf=None, Q=None):
+    _W.update(dct=dct, lvl=lvl, idf=idf, Q=Q)
+
+
+def _texts(names, addrs, countries, lvl, dct):
+    return [a + " " + b for a, b in zip(normalize_series(names, countries, lvl, "name", dct),
+                                        normalize_series(addrs, countries, lvl, "addr", dct))]
+
+
+def _hash_chunk(names, addrs, countries):
+    return HV.transform(_texts(names, addrs, countries, _W["lvl"], _W["dct"]))
+
+
+def _df_chunk(off, names, addrs, countries):
+    return np.bincount(_hash_chunk(names, addrs, countries).indices, minlength=HV.n_features).astype(np.int32)
+
+
+def _score_chunk(off, names, addrs, countries):
+    ci, cs = topk_sparse(_W["Q"], _tfidf(_hash_chunk(names, addrs, countries), _W["idf"]), 10, 1)
+    return np.where(ci >= 0, ci + off, -1), cs
+
+
+def _star_df(t):
+    return _df_chunk(*t)
+
+
+def _star_score(t):
+    return _score_chunk(*t)
+
+
+def _tfidf(H, idf):
+    H = H.copy()
+    np.log(H.data, out=H.data)
+    H.data += 1
+    H.data *= idf[H.indices]
+    return l2_normalize(H, copy=False)
 
 
 def main():
@@ -32,33 +80,50 @@ def main():
     ap.add_argument("--levels", default="1,4")
     ap.add_argument("--countries", default="", help="default: all test countries")
     ap.add_argument("--show", type=int, default=12)
+    ap.add_argument("--chunk", type=int, default=50_000, help="pool rows per parallel hashing task")
+    ap.add_argument("--workers", type=int, default=8, help="hashing processes (each ~0.5 GB RAM at chunk=50k)")
     args = ap.parse_args()
     setup(args, "08_france_probe")
+    # 08 only reads the test data, so it can be run early, in parallel with 06/07; a later call then skips.
+    marker = os.path.join(args.work, "results", "08_done.txt")
+    key = f"n={args.n} levels={args.levels} countries={args.countries} seed={args.seed}"
+    if os.path.exists(marker) and open(marker, encoding="utf-8").read().strip() == key:
+        step(f"already done ({key}) -- skipping; delete {marker} to re-run")
+        return
     s1 = load_cached(args, "test_s1")
     pool = pd.concat([load_cached(args, "test_s2"), load_cached(args, "test_s3")], ignore_index=True)
     dct = load_dict(os.path.join(args.work, "models", "translit_dict.json"))
     countries = args.countries.split(",") if args.countries else sorted(s1.country.unique())
-    hv = HashingVectorizer(analyzer="char_wb", ngram_range=(2, 4), n_features=2 ** 21, alternate_sign=False,
-                           norm=None, dtype=np.float32)
+    workers = max(1, min(args.n_jobs, args.workers))
     for cty in countries:
         q = s1[s1.country == cty].sample(min(args.n, int((s1.country == cty).sum())), random_state=args.seed)
         p = pool[pool.country == cty].reset_index(drop=True)
         qn_nums = [numbers(a) for a in q.addr.values]
-        pn_nums = [numbers(a) for a in p.addr.values]
+        pn_nums = {}  # filled lazily for neighbours only
+        n = len(p)
         for lvl in (int(x) for x in args.levels.split(",")):
             t0 = time.time()
-            qt = [a + " " + b for a, b in zip(normalize_series(q.name.values, q.country.values, lvl, "name", dct),
-                                              normalize_series(q.addr.values, q.country.values, lvl, "addr", dct))]
-            pt = [a + " " + b for a, b in zip(normalize_series(p.name.values, p.country.values, lvl, "name", dct),
-                                              normalize_series(p.addr.values, p.country.values, lvl, "addr", dct))]
-            Hp = hv.transform(pt)
-            tf = TfidfTransformer(sublinear_tf=True).fit(Hp[np.random.default_rng(0).choice(Hp.shape[0],
-                                                                                            min(500_000, Hp.shape[0]),
-                                                                                            replace=False)])
-            P = tf.transform(Hp).astype(np.float32)
-            Q = tf.transform(hv.transform(qt)).astype(np.float32)
-            idx, sc = topk_sparse(Q, P, 10, args.n_jobs)
+            step(f"{cty} L{lvl}: normalise + hash {n:,} pool records in {workers} processes")
+            tasks = [(i, p.name.values[i:i + args.chunk], p.addr.values[i:i + args.chunk],
+                      p.country.values[i:i + args.chunk]) for i in range(0, n, args.chunk)]
+            df = np.zeros(HV.n_features, np.float64)
+            with mp.get_context("spawn").Pool(workers, initializer=_init, initargs=(dct, lvl)) as mpp:
+                for d in mpp.imap_unordered(_star_df, tasks):
+                    df += d
+            idf = (np.log((1 + n) / (1 + df)) + 1).astype(np.float32)  # smooth idf over the FULL pool
+            Q = _tfidf(HV.transform(_texts(q.name.values, q.addr.values, q.country.values, lvl, dct)), idf)
+            idx = np.full((len(q), 10), -1, np.int64)
+            sc = np.zeros((len(q), 10), np.float32)
+            with mp.get_context("spawn").Pool(workers, initializer=_init, initargs=(dct, lvl, idf, Q)) as mpp:
+                for ci, cs in mpp.imap_unordered(_star_score, tasks):
+                    ai, as_ = np.hstack([idx, ci]), np.hstack([sc, cs])
+                    o = np.argsort(-as_, axis=1, kind="stable")[:, :10]
+                    idx, sc = np.take_along_axis(ai, o, 1), np.take_along_axis(as_, o, 1)
+            for j in np.unique(idx[:, :5][idx[:, :5] >= 0]):
+                if j not in pn_nums:
+                    pn_nums[j] = numbers(p.addr.values[j])
             secs = time.time() - t0
+            step(f"{cty} L{lvl}: done in {secs:.0f}s")
             agree1, agree5, has_num = [], [], []
             for i in range(len(q)):
                 a = qn_nums[i]
@@ -87,6 +152,8 @@ def main():
                         if jj >= 0:
                             pr = p.iloc[jj]
                             print(f"      {s:.3f} {pr.entity_id} {pr['name'][:55]} | {pr.addr[:90]}")
+    with open(marker, "w", encoding="utf-8") as f:
+        f.write(key)
 
 
 if __name__ == "__main__":

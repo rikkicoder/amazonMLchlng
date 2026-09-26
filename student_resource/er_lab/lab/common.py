@@ -84,7 +84,7 @@ def log_result(args, exp, variant, **metrics):
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
     show = ", ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in row.items()
                      if k not in ("exp", "variant", "universe", "time") and not isinstance(v, (dict, list)))
-    print(f"  RESULT [{exp}] {variant}: {show}")
+    print(f"  RESULT [{exp}] {variant}: {show}", flush=True)
 
 
 def udir(args, tag=None):

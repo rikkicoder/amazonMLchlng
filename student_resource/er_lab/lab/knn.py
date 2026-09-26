@@ -152,6 +152,28 @@ def svd_dense(Q, P, dim=128, fit_rows=200_000, seed=0):
     return q, p
 
 
+def _topk_dense_torch(q, p, k, block_bytes=1 << 30):
+    """Exact fp32 inner-product top-k on the GPU (same result as the numpy path, ~100x faster). None if no CUDA."""
+    try:
+        import torch
+    except ImportError:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    P = torch.from_numpy(np.ascontiguousarray(p, dtype=np.float32)).cuda()
+    ch = max(1, int(block_bytes // (4 * max(p.shape[0], 1))))
+    idx = np.zeros((q.shape[0], k), np.int64)
+    sc = np.zeros((q.shape[0], k), np.float32)
+    for i in range(0, q.shape[0], ch):
+        Q = torch.from_numpy(np.ascontiguousarray(q[i:i + ch], dtype=np.float32)).cuda()
+        v, j = torch.topk(Q @ P.T, k, dim=1)
+        idx[i:i + ch] = j.cpu().numpy()
+        sc[i:i + ch] = v.cpu().numpy()
+    del P
+    torch.cuda.empty_cache()
+    return idx, sc
+
+
 def topk_dense(q, p, k, n_jobs=1, hnsw=True):
     """Approximate (FAISS HNSW) or exact (numpy) inner-product top-k on dense normalised vectors."""
     k = int(min(k, p.shape[0]))
@@ -163,6 +185,9 @@ def topk_dense(q, p, k, n_jobs=1, hnsw=True):
         index.hnsw.efSearch = max(64, 2 * k)
         sc, idx = index.search(np.ascontiguousarray(q), k)
         return idx.astype(np.int64), sc.astype(np.float32)
+    gpu = _topk_dense_torch(q, p, k)
+    if gpu is not None:
+        return gpu
     idx = np.zeros((q.shape[0], k), np.int64)
     sc = np.zeros((q.shape[0], k), np.float32)
     ch = max(1, int(5e7 // max(p.shape[0], 1)))
