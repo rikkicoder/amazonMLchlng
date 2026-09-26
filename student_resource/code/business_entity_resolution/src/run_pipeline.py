@@ -302,8 +302,9 @@ def st_predict(a):
             for f, v in compute(S, P, cc.qi.values, cc.pj.values, idf, a.feat_workers).items():
                 cc[f] = v
             cc.to_parquet(path, index=False)
-        cc["pc"] = cheap.predict(cc[C.CHEAP].values.astype(np.float32))
+        cc["pc"] = cheap.predict(cc[C.CHEAP].values.astype(np.float32)).astype(np.float32)
         parts.append(cc[cc.pc >= dec["t_cheap"]])
+        del cc
         log(f"  test pairs {hi:,}/{len(c):,}: kept {sum(len(p) for p in parts):,} after the cheap filter")
     sv = pd.concat(parts, ignore_index=True)
     del parts, c
@@ -312,11 +313,31 @@ def st_predict(a):
         tri = tri_tables(a, "test", S, P)
         for f, v in compute(S, P, sv.qi.values, sv.pj.values, idf, a.feat_workers, tri=tri).items():
             sv[f] = v
+    del S
+    import gc
+    gc.collect()
     sv["p"] = full.predict(sv[cols1].values.astype(np.float32)).astype(np.float32)
     if dec.get("use_stage2", True):
+        # stage 2 in S1 chunks: its per-S1 features only look at that S1's candidates, the per-pool-record ones
+        # are computed once for everything first -> same result as one pass, a fraction of the peak memory
+        from ber.model import add_pj_features
         emb = np.load(os.path.join(a.work, "emb", "test_pool.npy"), mmap_mode="r")
-        d = stage2_frame(sv, pool, P["nname"], P["naddr"], emb, dec.get("use_s2x", False))
-        d = d[["qi", "pj"]].assign(p=m2.predict(d[dec["cols2"]].values.astype(np.float32)).astype(np.float32))
+        sv = add_pj_features(sv).sort_values("qi", kind="stable").reset_index(drop=True)
+        qv = sv.qi.values
+        cuts = [0]
+        for s in np.flatnonzero(np.r_[True, qv[1:] != qv[:-1]]):
+            if s - cuts[-1] >= 1_500_000:
+                cuts.append(int(s))
+        cuts.append(len(sv))
+        outs = []
+        for lo, hi in zip(cuts[:-1], cuts[1:]):
+            part = stage2_frame(sv.iloc[lo:hi].copy(), pool, P["nname"], P["naddr"], emb, dec.get("use_s2x", False))
+            outs.append(part[["qi", "pj"]].assign(
+                p=m2.predict(part[dec["cols2"]].values.astype(np.float32)).astype(np.float32)))
+            del part
+            gc.collect()
+            log(f"  stage 2 {hi:,}/{len(sv):,}")
+        d = pd.concat(outs, ignore_index=True)
     else:
         d = sv[["qi", "pj", "p"]]
     kept = apply_rule(d, dec.get("rule", "threshold"), dec.get("params", [dec.get("t_final", 0.5)]))

@@ -79,6 +79,20 @@ def _jac(a, b):
     return len(a & b) / u if u else np.nan
 
 
+def add_pj_features(d):
+    """Competition for the same pool record across all S1: number of claims, rank of this claim, best other p."""
+    s = d[["pj", "p"]]                       # slim copy: never sort / copy the wide frame
+    gp = s.groupby("pj")
+    d["s2_nclaim_pj"] = gp.p.transform("size").values.astype(np.float32)
+    d["s2_rank_pj"] = gp.p.rank(ascending=False, method="first").values.astype(np.float32)
+    pmax_pj = gp.p.transform("max").values
+    srt = s.sort_values(["pj", "p"], ascending=[True, False])
+    second = srt.groupby("pj").p.nth(1)
+    top2 = s.pj.map(pd.Series(second.values, index=srt.loc[second.index, "pj"].values)).fillna(0.0).values
+    d["s2_pmax_other_pj"] = np.where(s.p.values >= pmax_pj, top2, pmax_pj).astype(np.float32)
+    return d
+
+
 def stage2_features(d, pool_nname, pool_naddr, pool_nums, pool_src):
     """d: qi, pj, p (+ anything). Adds s2_* features: rank / share of the S1's best, competing strong candidates,
     competition for the same pool record, and similarity to the S1's strongest other candidate (sibling)."""
@@ -95,14 +109,8 @@ def stage2_features(d, pool_nname, pool_naddr, pool_nums, pool_src):
     d["_hi_s2"] = ((d.p > 0.5) & (src == "S2")).astype(np.float32)
     d["s2_nhi_same_src"] = np.where(src == "S3", d.groupby("qi")._hi_s3.transform("sum"),
                                     d.groupby("qi")._hi_s2.transform("sum"))
-    gp = d.groupby("pj")
-    d["s2_nclaim_pj"] = gp.p.transform("size").astype(np.float32)
-    d["s2_rank_pj"] = gp.p.rank(ascending=False, method="first").astype(np.float32)
-    pmax_pj = gp.p.transform("max")
-    srt = d.sort_values(["pj", "p"], ascending=[True, False])
-    second = srt.groupby("pj").p.nth(1)
-    top2 = d.pj.map(pd.Series(second.values, index=srt.loc[second.index, "pj"].values)).fillna(0.0)
-    d["s2_pmax_other_pj"] = np.where(d.p >= pmax_pj, top2, pmax_pj).astype(np.float32)
+    if "s2_nclaim_pj" not in d:            # pool-record features need every S1's claims; chunked callers
+        d = add_pj_features(d)             # compute them once up front with add_pj_features
     first = d[d.s2_rank_q == 0].set_index("qi").pj
     sec = d[d.s2_rank_q == 1].set_index("qi").pj
     ref = np.where(d.s2_rank_q.values == 0, d.qi.map(sec).fillna(-1).values, d.qi.map(first).values).astype(np.int64)
