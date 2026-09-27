@@ -406,6 +406,10 @@ def st_predict(a):
         d = pd.concat(outs, ignore_index=True)
     else:
         d = sv[["qi", "pj", "p"]]
+    try:                                        # scored candidates, for label-free diagnostics (e.g. by country)
+        d[["qi", "pj", "p"]].to_parquet(os.path.join(a.work, "feats", "test_scores.parquet"), index=False)
+    except Exception as e:                      # never let a diagnostic file stop the submission
+        log(f"could not save test scores: {e}")
     prep = None
     if dec.get("rule") == "gated":
         from ber.model import prep_rules

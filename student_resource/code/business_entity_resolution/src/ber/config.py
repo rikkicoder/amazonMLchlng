@@ -21,8 +21,15 @@ FT_BATCH = 128
 FT_LR = 2e-5
 
 # blocking: exact GPU nearest neighbours inside each country
+# A smaller candidate set ranks higher in the final evaluation. Widening to 20/5 (v5) raised blocking recall
+# 0.9921 -> 0.9954 but left held-out F0.5 flat (0.9851 vs 0.9852) and grew the final set 6.09 -> 7.62 per S1.
 K_FWD = 10                          # S1 -> pool top-k
 M_REV = 3                           # pool -> S1 top-m
+# index behind the search: "ivf" = inverted-file k-means lists, each query scans only its IVF_NPROBE nearest lists
+# (sublinear, the design that scales to billions); "exact" = scan the whole country (the v1-v5 setting)
+BLOCK_INDEX = "exact"
+IVF_LIST_SIZE = 1024                # average records per list -> n_lists = records / IVF_LIST_SIZE
+IVF_NPROBE = 32                     # lists scanned per query
 
 CTX = ["cos", "fwd_rank", "rev_rank", "gap_q", "rev_margin", "mutual", "n_cand_q", "is_s3"]
 NAME = ["name_tri_j", "name_tok_j", "core_tok_j", "core_contain", "core_exact", "nospace_eq", "nospace_contain",
