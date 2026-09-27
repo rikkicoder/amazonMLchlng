@@ -27,9 +27,12 @@ The challenge data is not included. The code expects it at `student_resource/dat
 | Version | Held-out F0.5 (training data) | Public leaderboard |
 |---|---|---|
 | v1 | 0.9796 (training density) | 0.9744 |
-| v2 | 0.9826 (test-like density) | **0.9793** |
+| v2 | 0.9826 (test-like density) | 0.9793 |
+| v4 | 0.9852 (test-like density) | **0.9811** |
 
 The held-out F0.5 is measured on slice B, folds 3–4.
+
+v4 adds name-uniqueness and fuzzy house-number features. Error analysis showed that 66% of missed matches were pool copies with empty addresses, and that house-number typos broke exact number matching.
 
 v2 adds:
 - training density that matches the test pool;
