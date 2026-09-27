@@ -30,7 +30,7 @@ import pandas as pd
 from ber import config as C
 from ber.util import Tee, exists, load_json, log, save_json
 
-STAGES = ["load", "dict", "norm", "finetune", "embed", "block", "feats", "train", "predict"]
+STAGES = ["load", "dict", "norm", "finetune", "embed", "block", "feats", "feats3", "train", "predict"]
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))       # student_resource/ when run in place
 
 
@@ -158,16 +158,42 @@ def st_feats(a):
     c.to_parquet(out, index=False)
 
 
+def st_feats3(a):
+    """Add the V3 features (name uniqueness, fuzzy house numbers) to the training features."""
+    from ber.v3 import PAIR_V3, v3_features
+    out = os.path.join(a.work, "feats", "train.parquet")
+    c = pd.read_parquet(out)
+    if all(f in c for f in PAIR_V3):
+        return
+    s1, pool, S, P, _ = split_arrays(a, "train")
+    lo, hi = C.TRAIN_HIDDEN_S1
+    present = ~((s1.prio.values >= lo) & (s1.prio.values < hi))
+    log(f"V3 features for {len(c):,} training pairs")
+    for f, v in v3_features(c.qi.values, c.pj.values, S["nname"], S["country"], S["addr"], present,
+                            P["nname"], P["country"], P["addr"]).items():
+        c[f] = v
+    c.to_parquet(out + ".tmp", index=False)
+    os.replace(out + ".tmp", out)
+
+
 def pool_nums(pool, pjs):
     from ber.text import numbers
     return {int(j): numbers(pool.addr.values[j]) for j in np.unique(pjs)}
 
 
+_CORE = {}
+
+
 def stage2_frame(sv, pool, pn, pa, emb, use_s2x):
     from ber.model import stage2_extra, stage2_features
+    from ber.v3 import core_names
     d = stage2_features(sv, pn, pa, pool_nums(pool, sv.pj.values), pool.src.values)
     if use_s2x:
-        d = stage2_extra(d, emb, pool.src.values)
+        key = id(pn)
+        if key not in _CORE:
+            _CORE.clear()
+            _CORE[key] = core_names(pn) if C.USE_V3 else None
+        d = stage2_extra(d, emb, pool.src.values, pool_core=_CORE[key])
     return d
 
 
@@ -191,7 +217,8 @@ def st_train(a):
     tune, hold = inB & (fold < 3), inB & (fold >= 3)
     FA, FB = F[inA[F.qi.values]], F[inB[F.qi.values]].copy()
     del F
-    cols1 = C.FULL + (C.PAIR_V2 if C.USE_V2 else [])
+    from ber.v3 import PAIR_V3
+    cols1 = C.FULL + (C.PAIR_V2 if C.USE_V2 else []) + (PAIR_V3 if C.USE_V3 else [])
     rep = {"A_s1": int(inA.sum()), "B_s1": int(inB.sum()), "A_pairs": len(FA), "B_pairs": len(FB), "cols1": cols1}
     log(f"A: {rep['A_s1']:,} S1 / {len(FA):,} pairs (pos {FA.label.mean():.2%}); B: {rep['B_s1']:,} S1 / "
         f"{len(FB):,} pairs; full matcher uses {len(cols1)} features")
@@ -340,6 +367,12 @@ def st_predict(a):
     if any(f in cols1 for f in C.PAIR_V2):
         tri = tri_tables(a, "test", S, P)
         for f, v in compute(S, P, sv.qi.values, sv.pj.values, idf, a.feat_workers, tri=tri).items():
+            sv[f] = v
+    if any(f in cols1 for f in ("n_s1_core_q", "num_min_edit")):
+        from ber.v3 import v3_features
+        log("V3 features for the test candidates")
+        for f, v in v3_features(sv.qi.values, sv.pj.values, S["nname"], S["country"], S["addr"],
+                                np.ones(len(s1), bool), P["nname"], P["country"], P["addr"]).items():
             sv[f] = v
     del S
     import gc

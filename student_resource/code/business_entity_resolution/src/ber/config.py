@@ -45,6 +45,7 @@ LGB_STAGE2 = dict(objective="binary", learning_rate=0.05, num_leaves=31, min_dat
 LGB_ROUNDS = 2000
 
 USE_V2 = True                       # V2 pair features in the full matcher
+USE_V3 = True                       # V3 features: name uniqueness + fuzzy house numbers
 USE_S2X = True                      # embedding-cluster + relative features in stage 2
 LGB_FULL = LGB_PARAMS               # full-matcher parameters
 RULES_TRY = ("threshold", "top1_plus", "relative", "expected_f")   # decision rules compared on B folds 0-2

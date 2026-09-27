@@ -155,7 +155,7 @@ def _group_pairs(qi):
     return I[k], J[k], np.arange(n) - gst
 
 
-def stage2_extra(d, pool_emb, pool_src, chunk_rows=1_500_000):
+def stage2_extra(d, pool_emb, pool_src, chunk_rows=1_500_000, pool_core=None):
     """Cluster features from the fine-tuned embeddings of the S1's candidates (true matches of one S1 are the
     S2/S3 copies of one business and sit close together; look-alikes form other clusters) + each raw signal
     relative to the best candidate of the same S1. d must be sorted by (qi, p desc) with a 0..n-1 index."""
@@ -166,7 +166,7 @@ def stage2_extra(d, pool_emb, pool_src, chunk_rows=1_500_000):
     n = len(d)
     qi, pj, p = d.qi.values, d.pj.values, d.p.values.astype(np.float32)
     src = pool_src[pj]
-    out = {c: np.full(n, np.nan, np.float32) for c in S2X_COLS[:5]}
+    out = {c: np.full(n, np.nan, np.float32) for c in S2X_COLS[:5] + (["x_sib_core_hi"] if pool_core is not None else [])}
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     starts = np.flatnonzero(np.r_[True, qi[1:] != qi[:-1]])
     bounds = [0]
@@ -198,6 +198,10 @@ def stage2_extra(d, pool_emb, pool_src, chunk_rows=1_500_000):
         out["x_emb_max_hi_other"][a + mo.index.values] = mo.values
         sib = rank[J] == np.where(rank[I] == 0, 1, 0)
         out["x_emb_sib_top"][a + I[sib]] = cos[sib]
+        if pool_core is not None:      # high-p siblings carrying exactly the same core name (empty-address copies)
+            cc = pool_core[pj[a:b]]
+            same = hi & (cc[I] == cc[J])
+            out["x_sib_core_hi"][a:b] = np.bincount(I[same], minlength=m)
     for c, v in out.items():
         d[c] = v
     return d

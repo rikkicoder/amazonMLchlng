@@ -84,8 +84,9 @@ def main():
     # 1. loss decomposition for the current decision rule
     d2 = d[["qi", "pj"]].assign(p=p2)
     s = prep_rules(d2)
-    params, _ = tune_rule(d2, own, k, tune, dec["rule"], prepared=s)
-    kept = apply_rule(d2, dec["rule"], params, prepared=s)
+    rule0 = "top1_plus" if dec["rule"] == "gated" else dec["rule"]
+    params, _ = tune_rule(d2, own, k, tune, rule0, prepared=s)
+    kept = apply_rule(d2, rule0, params, prepared=s)
     f, npred, tp = per_entity_f05(kept.qi.values, kept.pj.values, own, k)
     n = hold.sum()
     L = 1 - f
@@ -97,7 +98,7 @@ def main():
         "nonsingleton_extra_only": non & (npred > 0) & (tp == k) & (npred > tp),
         "nonsingleton_missed_and_extra": non & (npred > 0) & (tp < k) & (npred > tp),
     }
-    dec_rep = {"rule": dec["rule"], "params": list(params), "f05_holdout": float(f[hold].mean()),
+    dec_rep = {"rule": rule0, "params": list(params), "f05_holdout": float(f[hold].mean()),
                "singleton_rate": float((k[hold] == 0).mean())}
     for name, msk in parts.items():
         dec_rep[name] = {"share_of_S1": float(msk.sum() / n), "f05_loss": float(L[msk].sum() / n)}
@@ -111,6 +112,40 @@ def main():
     dec_rep["predicted_empty_nonsingletons_with_a_true_candidate"] = float((surv_tp[empty_non] > 0).mean())
     rep["loss_decomposition"] = dec_rep
     log(f"loss decomposition: {dec_rep}")
+
+    # 1b. what the rejected true matches and the false merges look like
+    kp = set(zip(kept.qi.values, kept.pj.values))
+    dd = d.assign(p2=p2, kept=[(q_, j_) in kp for q_, j_ in zip(d.qi.values, d.pj.values)])
+    dd = dd[hold[dd.qi.values]]
+    miss = dd[(dd.label == 1) & ~dd.kept]
+    fp = dd[(dd.label == 0) & dd.kept]
+    miss_empty_q = np.isin(miss.qi.values, np.where(npred == 0)[0])
+    cat = {
+        "n_missed_in_candidates": int(len(miss)), "n_false_merges": int(len(fp)),
+        "missed_pool_name_indic": float(miss.c_indic.mean()),
+        "all_true_pool_name_indic": float(dd[dd.label == 1].c_indic.mean()),
+        "missed_pool_addr_empty": float(miss.addr_empty_c.mean()),
+        "all_true_pool_addr_empty": float(dd[dd.label == 1].addr_empty_c.mean()),
+        "missed_whose_S1_got_nothing": float(miss_empty_q.mean()),
+        "missed_p2_quantiles": [float(x) for x in np.quantile(miss.p2, [0.1, 0.25, 0.5, 0.75, 0.9])],
+        "missed_fwd_rank_nan(rev_only)": float(miss.fwd_rank.isna().mean()),
+        "missed_num_conflict": float((miss.num_conflict == 1).mean()),
+        "missed_name_jw_quantiles": [float(x) for x in np.quantile(miss.name_jw.fillna(0), [0.1, 0.25, 0.5, 0.75, 0.9])],
+        "fp_p2_quantiles": [float(x) for x in np.quantile(fp.p2, [0.1, 0.5, 0.9])] if len(fp) else [],
+        "fp_owner_is_other_S1": float((own[fp.pj.values] >= 0).mean()) if len(fp) else None,
+        "missed_by_country": pd.Series(cty[miss.qi.values]).value_counts(normalize=True).round(3).to_dict()}
+    rep["error_profile"] = cat
+    log(f"error profile: {cat}")
+    rng = np.random.default_rng(0)
+    for title, df_ in (("MISSED TRUE MATCHES", miss), ("FALSE MERGES", fp)):
+        log(f"--- sample of {title} ---")
+        for i in rng.choice(len(df_), size=min(25, len(df_)), replace=False) if len(df_) else []:
+            r = df_.iloc[i]
+            q_, j_ = int(r.qi), int(r.pj)
+            print(f"  p2={r.p2:.3f} p1={r.p:.3f} cos={r.cos:.3f} fwd={r.fwd_rank} rev={r.rev_rank} "
+                  f"name_jw={r.name_jw:.2f} num_share={r.num_share} | S1 [{cty[q_]}] {s1.name.values[q_][:45]} | "
+                  f"{s1.addr.values[q_][:70]}")
+            print(f"      -> {pool.src.values[j_]} {pool.name.values[j_][:45]} | {pool.addr.values[j_][:70]}")
 
     # 2. ceiling of perfect singleton detection
     d_or = d2[k[d2.qi.values] > 0]
